@@ -10,6 +10,9 @@ One-page PySide6 desktop app with:
 - Board/List reporting mode.
 - Parent task subtask reporting mode.
 - Task title field.
+- Automatic Claude-generated title when the title field is left blank.
+- Automatic Claude formatting of descriptions into URLs/Location and Requirements.
+- Optional searchable assignee picker populated from authorised ClickUp Workspaces.
 - Combined description and screenshot field.
 - ClickUp task creation.
 - Pasted screenshots embedded into the task description.
@@ -23,7 +26,8 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Add `CLICKUP_API_TOKEN` to `.env`. The app does not show a token field.
+Add `CLICKUP_API_TOKEN` and `ANTHROPIC_API_KEY` to `.env`. Claude formats every
+description and generates missing task titles. The app does not show API key fields.
 
 ## Run
 

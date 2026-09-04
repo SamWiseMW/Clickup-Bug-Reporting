@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import mimetypes
 import os
+import random
 import re
 import sys
 import tempfile
@@ -13,19 +15,36 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from dotenv import load_dotenv
-from PySide6.QtCore import QPointF, QObject, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    Property,
+    QEasingCurve,
+    QPointF,
+    QRectF,
+    QObject,
+    QStringListModel,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+    QPropertyAnimation,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
     QIcon,
     QImage,
+    QLinearGradient,
     QPainter,
+    QPen,
+    QPixmap,
     QRadialGradient,
     QTextDocument,
     QTextImageFormat,
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCompleter,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -34,12 +53,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QStyle,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from clickup_client import ClickUpClient, ClickUpError
+from claude_client import ClaudeClient, ClaudeError
 
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -65,8 +86,80 @@ TASK_QUERY_KEYS = (
 WORKSPACE_QUERY_KEYS = ("team_id", "teamId", "team", "workspace_id", "workspaceId")
 TASK_PATH_MARKERS = ("t", "task", "tasks")
 NON_TASK_CLICKUP_PATH_PARTS = {"v", "l", "li", "b", "board", "list", "s", "space", "f", "folder"}
+IMAGE_PREVIEW_MAX_WIDTH = 320
+IMAGE_PREVIEW_MAX_HEIGHT = 120
+HOVER_FADE_MS = 180
+DEFAULT_TASK_STATUS = "to do"
+APP_ICON_PATH = Path(__file__).with_name("public") / (
+    "favicon.ico" if sys.platform == "win32" else "favicon.png"
+)
+WINDOWS_APP_USER_MODEL_ID = "MW.ClickUpBugReporter"
 
-APP_STYLE = """
+
+def configure_windows_app_identity() -> None:
+    if sys.platform != "win32":
+        return
+
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            WINDOWS_APP_USER_MODEL_ID
+        )
+    except (AttributeError, OSError):
+        pass
+
+
+@dataclass(frozen=True)
+class AccentTheme:
+    accent: str
+    button: str
+    button_hover: str
+    button_text: str
+    muted_icon: str
+    selection: str
+    accent_rgb: tuple[int, int, int]
+    button_rgb: tuple[int, int, int]
+
+
+def create_accent_theme(hue: int | None = None) -> AccentTheme:
+    selected_hue = random.SystemRandom().randrange(360) if hue is None else hue % 360
+    accent_color = QColor.fromHsv(selected_hue, 150, 200)
+    button_color = QColor(accent_color)
+    button_hover_color = QColor.fromHsv(selected_hue, 140, 215)
+    muted_icon_color = QColor.fromHsv(selected_hue, 90, 150)
+    selection_color = QColor.fromHsv(selected_hue, 170, 135)
+
+    linear_channels = []
+    for channel in (button_color.red(), button_color.green(), button_color.blue()):
+        normalized = channel / 255
+        linear_channels.append(
+            normalized / 12.92
+            if normalized <= 0.04045
+            else ((normalized + 0.055) / 1.055) ** 2.4
+        )
+    luminance = (
+        0.2126 * linear_channels[0]
+        + 0.7152 * linear_channels[1]
+        + 0.0722 * linear_channels[2]
+    )
+    button_text = "#111315" if luminance >= 0.18 else "#ffffff"
+
+    return AccentTheme(
+        accent=accent_color.name(),
+        button=button_color.name(),
+        button_hover=button_hover_color.name(),
+        button_text=button_text,
+        muted_icon=muted_icon_color.name(),
+        selection=selection_color.name(),
+        accent_rgb=(accent_color.red(), accent_color.green(), accent_color.blue()),
+        button_rgb=(button_color.red(), button_color.green(), button_color.blue()),
+    )
+
+
+ACTIVE_THEME = create_accent_theme()
+
+APP_STYLE_TEMPLATE = """
 * {
     font-family: "Segoe UI", "Inter", Arial, sans-serif;
     letter-spacing: 0;
@@ -74,7 +167,7 @@ APP_STYLE = """
 
 QMainWindow,
 QWidget#root {
-    background: #0a1408;
+    background: #070809;
     color: #e5e2e1;
 }
 
@@ -91,31 +184,20 @@ QFrame#editorFrame {
     border-radius: 8px;
 }
 
-QFrame#inputFrame[focused="true"],
-QFrame#editorFrame[focused="true"] {
-    border: 1px solid #97d787;
-}
-
 QFrame#statusPill {
-    background: rgba(20, 79, 16, 70);
-    border: 1px solid rgba(151, 215, 135, 90);
+    background: rgba(__BUTTON_RGB__, 70);
+    border: 1px solid rgba(__ACCENT_RGB__, 90);
     border-radius: 12px;
 }
 
 QFrame#toast {
-    background: rgba(20, 79, 16, 150);
-    border: 1px solid rgba(151, 215, 135, 110);
+    background: rgba(__BUTTON_RGB__, 150);
+    border: 1px solid rgba(__ACCENT_RGB__, 110);
     border-radius: 12px;
 }
 
-QFrame#iconBox {
-    background: rgba(151, 215, 135, 35);
-    border: 1px solid rgba(151, 215, 135, 80);
-    border-radius: 8px;
-}
-
 QFrame#divider {
-    background: rgba(65, 73, 61, 70);
+    background: rgba(__ACCENT_RGB__, 45);
     min-height: 1px;
     max-height: 1px;
 }
@@ -133,7 +215,7 @@ QLabel {
 QLabel#muted,
 QLabel#fieldLabel,
 QLabel#smallText {
-    color: #c1c9ba;
+    color: #bfc1c3;
 }
 
 QLabel#title {
@@ -142,18 +224,13 @@ QLabel#title {
     font-weight: 700;
 }
 
-QLabel#subtitle {
-    color: #c1c9ba;
-    font-size: 18px;
-}
-
 QLabel#accent {
-    color: #97d787;
+    color: __ACCENT__;
     font-weight: 700;
 }
 
 QLabel#iconText {
-    color: #c1c9ba;
+    color: #bfc1c3;
     font-size: 20px;
     font-weight: 700;
 }
@@ -164,15 +241,22 @@ QLineEdit {
     border: none;
     padding: 0;
     min-height: 24px;
-    selection-background-color: #316b29;
+    selection-background-color: __SELECTION__;
 }
 
 QLineEdit::placeholder {
-    color: #41493d;
+    color: #55585b;
 }
 
 QLineEdit:focus {
     border: none;
+}
+
+QAbstractItemView {
+    background: #201f1f;
+    color: #e5e2e1;
+    border: 1px solid #484a4d;
+    selection-background-color: __SELECTION__;
 }
 
 QTextEdit {
@@ -182,13 +266,13 @@ QTextEdit {
     border-radius: 0;
     padding: 0;
     line-height: 1.4;
-    selection-background-color: #316b29;
+    selection-background-color: __SELECTION__;
 }
 
 QPushButton {
     background: #201f1f;
     color: #e5e2e1;
-    border: 1px solid rgba(65, 73, 61, 96);
+    border: 1px solid rgba(72, 74, 77, 96);
     border-radius: 8px;
     padding: 12px 28px;
     font-weight: 700;
@@ -203,41 +287,53 @@ QPushButton:pressed {
 }
 
 QPushButton:disabled {
-    color: #8b9385;
+    color: #85888b;
     background: #1c1b1b;
-    border-color: rgba(65, 73, 61, 70);
+    border-color: rgba(72, 74, 77, 70);
 }
 
 QPushButton#primaryButton {
-    background: #144f10;
-    border: 1px solid rgba(151, 215, 135, 100);
-    color: #ffffff;
+    background: __BUTTON__;
+    border: 1px solid rgba(__ACCENT_RGB__, 115);
+    color: __BUTTON_TEXT__;
     border-radius: 8px;
     padding: 12px 30px;
     font-size: 16px;
 }
 
 QPushButton#primaryButton:hover {
-    background: #175c12;
+    background: __BUTTON_HOVER__;
 }
 
 QPushButton#ghostButton {
     background: transparent;
     border: none;
-    color: #c1c9ba;
+    color: #bfc1c3;
     padding: 8px 14px;
 }
 
 QPushButton#ghostButton:hover {
     background: #2a2a2a;
-    color: #97d787;
+    color: __ACCENT__;
+}
+
+QPushButton#compactGhostButton {
+    background: transparent;
+    border: none;
+    color: #bfc1c3;
+    padding: 3px 10px;
+}
+
+QPushButton#compactGhostButton:hover {
+    background: #2a2a2a;
+    color: __ACCENT__;
 }
 
 QPushButton#tabButton {
     background: transparent;
     border: none;
     border-radius: 0;
-    color: #c1c9ba;
+    color: #bfc1c3;
     padding: 0 0 14px 0;
     font-size: 14px;
     font-weight: 500;
@@ -249,8 +345,8 @@ QPushButton#tabButton:hover {
 }
 
 QPushButton#tabButton[active="true"] {
-    color: #97d787;
-    border-bottom: 2px solid #97d787;
+    color: __ACCENT__;
+    border-bottom: 2px solid __ACCENT__;
     font-weight: 700;
 }
 
@@ -261,13 +357,13 @@ QScrollBar:vertical {
 }
 
 QScrollBar::handle:vertical {
-    background: #41493d;
+    background: #484a4d;
     min-height: 32px;
     border-radius: 6px;
 }
 
 QScrollBar::handle:vertical:hover {
-    background: #8b9385;
+    background: #85888b;
 }
 
 QScrollBar::add-line:vertical,
@@ -282,6 +378,41 @@ QMessageBox {
 """
 
 
+def build_app_style(theme: AccentTheme) -> str:
+    replacements = {
+        "__ACCENT__": theme.accent,
+        "__BUTTON__": theme.button,
+        "__BUTTON_HOVER__": theme.button_hover,
+        "__BUTTON_TEXT__": theme.button_text,
+        "__SELECTION__": theme.selection,
+        "__ACCENT_RGB__": ", ".join(map(str, theme.accent_rgb)),
+        "__BUTTON_RGB__": ", ".join(map(str, theme.button_rgb)),
+    }
+    style = APP_STYLE_TEMPLATE
+    for token, value in replacements.items():
+        style = style.replace(token, value)
+    return style
+
+
+APP_STYLE = build_app_style(ACTIVE_THEME)
+
+
+def tint_icon(icon: QIcon, color: QColor, size: int = 16) -> QIcon:
+    source = icon.pixmap(size, size)
+    tinted = QPixmap(source.size())
+    tinted.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(tinted)
+    painter.drawPixmap(0, 0, source)
+    painter.setCompositionMode(
+        QPainter.CompositionMode.CompositionMode_SourceIn
+    )
+    painter.fillRect(tinted.rect(), color)
+    painter.end()
+
+    return QIcon(tinted)
+
+
 @dataclass(frozen=True)
 class TaskReference:
     task_id: str
@@ -292,27 +423,52 @@ class AtmosphericRoot(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override name
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#0a1408"))
+        painter.fillRect(self.rect(), QColor("#070809"))
 
         width = max(self.width(), 1)
         height = max(self.height(), 1)
+        accent_red, accent_green, accent_blue = ACTIVE_THEME.accent_rgb
+        button_red, button_green, button_blue = ACTIVE_THEME.button_rgb
 
-        first_glow = QRadialGradient(QPointF(width * 0.2, height * 0.3), width * 0.55)
-        first_glow.setColorAt(0.0, QColor(20, 79, 16, 58))
-        first_glow.setColorAt(1.0, QColor(20, 79, 16, 0))
+        first_glow = QRadialGradient(QPointF(width * 0.2, height * 0.18), width * 0.55)
+        first_glow.setColorAt(
+            0.0,
+            QColor(button_red, button_green, button_blue, 54),
+        )
+        first_glow.setColorAt(
+            1.0,
+            QColor(button_red, button_green, button_blue, 0),
+        )
         painter.fillRect(self.rect(), first_glow)
 
-        second_glow = QRadialGradient(QPointF(width * 0.8, height * 0.7), width * 0.45)
-        second_glow.setColorAt(0.0, QColor(20, 79, 16, 42))
-        second_glow.setColorAt(1.0, QColor(20, 79, 16, 0))
+        second_glow = QRadialGradient(QPointF(width * 0.8, height * 0.16), width * 0.45)
+        second_glow.setColorAt(
+            0.0,
+            QColor(button_red, button_green, button_blue, 38),
+        )
+        second_glow.setColorAt(
+            1.0,
+            QColor(button_red, button_green, button_blue, 0),
+        )
         painter.fillRect(self.rect(), second_glow)
 
         corner_glow = QRadialGradient(QPointF(-80, -80), 360)
-        corner_glow.setColorAt(0.0, QColor(151, 215, 135, 28))
-        corner_glow.setColorAt(1.0, QColor(151, 215, 135, 0))
+        corner_glow.setColorAt(
+            0.0,
+            QColor(accent_red, accent_green, accent_blue, 24),
+        )
+        corner_glow.setColorAt(
+            1.0,
+            QColor(accent_red, accent_green, accent_blue, 0),
+        )
         painter.fillRect(self.rect(), corner_glow)
 
-        painter.setPen(QColor(151, 215, 135, 18))
+        bottom_fade = QLinearGradient(0, height * 0.42, 0, height)
+        bottom_fade.setColorAt(0.0, QColor(3, 4, 5, 0))
+        bottom_fade.setColorAt(1.0, QColor(3, 4, 5, 235))
+        painter.fillRect(self.rect(), bottom_fade)
+
+        painter.setPen(QColor(accent_red, accent_green, accent_blue, 16))
         for index in range(260):
             digest = hashlib.blake2b(str(index).encode(), digest_size=4).digest()
             x = int.from_bytes(digest[:2], "big") % width
@@ -320,6 +476,58 @@ class AtmosphericRoot(QWidget):
             painter.drawPoint(x, y)
 
         super().paintEvent(event)
+
+
+class HoverFadeFrame(QFrame):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._hover_strength = 0.0
+        self._hover_animation = QPropertyAnimation(self, b"hoverStrength", self)
+        self._hover_animation.setDuration(HOVER_FADE_MS)
+        self._hover_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def get_hover_strength(self) -> float:
+        return self._hover_strength
+
+    def set_hover_strength(self, value: float) -> None:
+        self._hover_strength = max(0.0, min(1.0, value))
+        self.update()
+
+    hoverStrength = Property(float, get_hover_strength, set_hover_strength)
+
+    def enterEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        self._set_hover_state(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        self._set_hover_state(False)
+        super().leaveEvent(event)
+
+    def _set_hover_state(self, hovered: bool) -> None:
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._hover_strength)
+        self._hover_animation.setEndValue(1.0 if hovered else 0.0)
+        self._hover_animation.start()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        super().paintEvent(event)
+
+        if self._hover_strength <= 0:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        color = QColor(ACTIVE_THEME.accent)
+        color.setAlpha(int(190 * self._hover_strength))
+        pen = QPen(color)
+        pen.setWidthF(1.2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        rect = QRectF(self.rect()).adjusted(0.75, 0.75, -0.75, -0.75)
+        painter.drawRoundedRect(rect, 8, 8)
 
 
 class FocusLineEdit(QLineEdit):
@@ -420,8 +628,10 @@ class DescriptionEditor(QTextEdit):
 
         image_format = QTextImageFormat()
         image_format.setName(image_url.toString())
-        if image.width() > 720:
-            image_format.setWidth(720)
+        preview_width, preview_height = self._preview_size(image)
+        if preview_width and preview_height:
+            image_format.setWidth(preview_width)
+            image_format.setHeight(preview_height)
 
         cursor = self.textCursor()
         cursor.beginEditBlock()
@@ -430,12 +640,41 @@ class DescriptionEditor(QTextEdit):
         cursor.endEditBlock()
         self.setTextCursor(cursor)
 
+    def _preview_size(self, image: QImage) -> tuple[int, int]:
+        width = image.width()
+        height = image.height()
+        if width <= 0 or height <= 0:
+            return 0, 0
+
+        scale = min(
+            IMAGE_PREVIEW_MAX_WIDTH / width,
+            IMAGE_PREVIEW_MAX_HEIGHT / height,
+            1,
+        )
+        return max(1, int(width * scale)), max(1, int(height * scale))
+
     def _coerce_image(self, value) -> QImage:
         if isinstance(value, QImage):
             return value
         if hasattr(value, "toImage"):
             return value.toImage()
         return QImage()
+
+
+class LoadAssigneesWorker(QObject):
+    finished = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self.token = token
+
+    def run(self) -> None:
+        try:
+            client = ClickUpClient(lambda: self.token)
+            self.finished.emit(extract_workspace_members(client.get_workspaces()))
+        except (ClickUpError, KeyError, ValueError) as error:
+            self.failed.emit(str(error))
 
 
 class CreateTaskWorker(QObject):
@@ -452,6 +691,9 @@ class CreateTaskWorker(QObject):
         *,
         mode: str,
         target_workspace_id: str = "",
+        assignee_id: int | None = None,
+        claude_api_key: str = "",
+        title_source: str = "",
     ) -> None:
         super().__init__()
         self.token = token
@@ -460,11 +702,37 @@ class CreateTaskWorker(QObject):
         self.description = description
         self.mode = mode
         self.target_workspace_id = target_workspace_id
+        self.assignee_id = assignee_id
+        self.claude_api_key = claude_api_key
+        self.title_source = title_source
 
     def run(self) -> None:
         try:
             client = ClickUpClient(lambda: self.token)
+            claude_client = ClaudeClient(self.claude_api_key)
+
+            self.status_changed.emit("Organising description with Claude...")
+            description_source, screenshots = extract_screenshot_placeholders(
+                self.description
+            )
+            description = claude_client.format_bug_description(description_source)
+            if not description.strip():
+                raise ClaudeError(
+                    "Add a clear description of the issue before submitting."
+                )
+            description = restore_screenshot_markdown(description, screenshots)
+
+            title = self.title
+            if not title:
+                self.status_changed.emit("Generating title with Claude...")
+                title = claude_client.generate_bug_title(self.title_source)
+            if not title.strip():
+                raise ClaudeError(
+                    "Add a clear description so a task title can be generated."
+                )
+
             self.status_changed.emit("Creating subtask..." if self.mode == "subtask" else "Creating task...")
+            task_dates = task_dates_for_today()
 
             if self.mode == "subtask":
                 parent_task = resolve_parent_task(
@@ -475,25 +743,29 @@ class CreateTaskWorker(QObject):
                 list_id = extract_task_list_id(parent_task)
                 parent_task_id = str(parent_task.get("id") or self.target_id)
                 payload = {
-                    "name": self.title,
-                    "markdown_content": self.description,
+                    "name": title,
+                    "markdown_content": description,
                     "tags": ["bug"],
+                    "status": DEFAULT_TASK_STATUS,
                     "parent": parent_task_id,
+                    **task_dates,
                 }
             else:
                 list_id = resolve_board_list_id(client, self.target_id)
                 payload = {
-                    "name": self.title,
-                    "markdown_content": self.description,
+                    "name": title,
+                    "markdown_content": description,
                     "tags": ["bug"],
+                    "status": DEFAULT_TASK_STATUS,
+                    **task_dates,
                 }
 
-            task = client.create_task(
-                list_id,
-                payload,
-            )
+            if self.assignee_id is not None:
+                payload["assignees"] = [self.assignee_id]
+
+            task = create_task_with_status_fallback(client, list_id, payload)
             self.finished.emit(task.get("url", ""))
-        except (ClickUpError, KeyError, ValueError) as error:
+        except (ClaudeError, ClickUpError, KeyError, ValueError) as error:
             self.failed.emit(str(error))
 
 
@@ -501,26 +773,36 @@ class BugReporterWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ClickUp Bug Reporter")
+        self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1024, 760)
         self.resize(1280, 900)
 
         self.token = os.getenv("CLICKUP_API_TOKEN", "").strip()
+        self.claude_api_key = (
+            os.getenv("ANTHROPIC_API_KEY", "").strip()
+            or os.getenv("CLAUDE_API_KEY", "").strip()
+        )
         self.attachments: list[Path] = []
         self.status_message = "Ready"
-        self.mode = "subtask"
+        self.mode = "board"
         self.worker_thread: QThread | None = None
         self.worker: CreateTaskWorker | None = None
+        self.assignee_thread: QThread | None = None
+        self.assignee_worker: LoadAssigneesWorker | None = None
+        self.assignee_ids_by_label: dict[str, int] = {}
+        self.show_assignee_load_errors = False
         self.toast: QFrame | None = None
 
         self.setCentralWidget(self._build_ui())
         self._set_status("Ready" if self.token else "CLICKUP_API_TOKEN missing")
+        QTimer.singleShot(0, self._load_assignees)
 
     def _build_ui(self) -> QWidget:
         root = AtmosphericRoot()
         root.setObjectName("root")
 
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(40, 32, 40, 24)
+        layout.setContentsMargins(40, 16, 40, 24)
         layout.setSpacing(0)
 
         actions = QHBoxLayout()
@@ -534,7 +816,7 @@ class BugReporterWindow(QMainWindow):
         content.setFixedWidth(680)
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(56)
+        content_layout.setSpacing(24)
 
         content_layout.addLayout(self._build_header())
         content_layout.addWidget(self._build_task_panel())
@@ -542,7 +824,6 @@ class BugReporterWindow(QMainWindow):
         layout.addStretch(2)
         layout.addWidget(content, 0, Qt.AlignmentFlag.AlignHCenter)
         layout.addStretch(2)
-        layout.addWidget(self._build_footer(), 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.toast = self._build_toast(root)
         self.toast.hide()
@@ -551,7 +832,7 @@ class BugReporterWindow(QMainWindow):
 
     def _build_header(self) -> QVBoxLayout:
         header = QVBoxLayout()
-        header.setSpacing(16)
+        header.setSpacing(8)
 
         title_row = QHBoxLayout()
         title_row.setSpacing(0)
@@ -560,7 +841,7 @@ class BugReporterWindow(QMainWindow):
         title_block = QVBoxLayout()
         title_block.setSpacing(2)
 
-        self.page_title = QLabel("Report as Subtask")
+        self.page_title = QLabel("Create New Task")
         self.page_title.setObjectName("title")
         self.page_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_block.addWidget(self.page_title)
@@ -569,12 +850,6 @@ class BugReporterWindow(QMainWindow):
         title_row.addStretch(1)
         header.addLayout(title_row)
 
-        self.page_subtitle = QLabel("Submit high-priority technical issues to the DevOps Suite console.")
-        self.page_subtitle.setObjectName("subtitle")
-        self.page_subtitle.setWordWrap(True)
-        self.page_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.addWidget(self.page_subtitle)
-
         return header
 
     def _build_task_panel(self) -> QFrame:
@@ -582,29 +857,32 @@ class BugReporterWindow(QMainWindow):
         panel.setObjectName("formPanel")
 
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(40, 34, 40, 40)
-        layout.setSpacing(28)
+        layout.setContentsMargins(40, 24, 40, 32)
+        layout.setSpacing(18)
 
         layout.addLayout(self._build_tabs())
 
         self.target_input = FocusLineEdit()
-        self.target_field_label = "PARENT TASK URL"
+        self.target_field_label = "BOARD / LIST URL"
         target_field = self._build_input_field(
             self.target_field_label,
-            "↔",
-            "https://devops.suite/task/DEV-12345",
+            "",
+            "ClickUp List URL or List ID",
             self.target_input,
         )
         layout.addWidget(target_field)
 
+        layout.addWidget(self._build_assignee_field())
+
         self.title_input = FocusLineEdit()
-        title_field = self._build_input_field(
-            "TASK TITLE",
+        self.title_field = self._build_input_field(
+            "TASK TITLE (OPTIONAL)",
             "",
-            "Short descriptive summary of the issue",
+            "Leave blank to generate: Page name | brief issue",
             self.title_input,
         )
-        layout.addWidget(title_field)
+        self.title_field.hide()
+        layout.addWidget(self.title_field)
 
         layout.addWidget(self._build_description_field())
         layout.addWidget(self._build_divider())
@@ -639,19 +917,23 @@ class BugReporterWindow(QMainWindow):
         return wrapper
 
     def _set_mode(self, mode: str) -> None:
+        if mode == self.mode:
+            return
+
         self.mode = mode
         if hasattr(self, "target_input"):
-            if mode == "subtask":
-                self.page_title.setText("Report as Subtask")
-                self.page_subtitle.setText("Submit high-priority technical issues to the DevOps Suite console.")
-                self.target_label.setText("PARENT TASK URL")
-                self.target_input.setPlaceholderText("https://app.clickup.com/t/...")
-            else:
-                self.page_title.setText("Create New Task")
-                self.page_subtitle.setText("Log a new sprint item or developer task into the DevOps Suite ecosystem.")
-                self.target_label.setText("BOARD / LIST URL")
-                self.target_input.setPlaceholderText("ClickUp List URL or List ID")
+            self._apply_mode_copy(mode)
         self._refresh_tabs()
+
+    def _apply_mode_copy(self, mode: str) -> None:
+        if mode == "subtask":
+            self.page_title.setText("Create New Task")
+            self.target_label.setText("PARENT TASK URL")
+            self.target_input.setPlaceholderText("https://app.clickup.com/t/...")
+        else:
+            self.page_title.setText("Create New Task")
+            self.target_label.setText("BOARD / LIST URL")
+            self.target_input.setPlaceholderText("ClickUp List URL or List ID")
 
     def _refresh_tabs(self) -> None:
         for button, active in (
@@ -678,12 +960,14 @@ class BugReporterWindow(QMainWindow):
         label.setObjectName("fieldLabel")
         if input_widget is getattr(self, "target_input", None):
             self.target_label = label
+            self.target_field = field
         layout.addWidget(label)
 
-        frame = QFrame()
+        frame = HoverFadeFrame()
         frame.setObjectName("inputFrame")
+        frame.setFixedHeight(40)
         frame_layout = QHBoxLayout(frame)
-        frame_layout.setContentsMargins(18, 11, 18, 11)
+        frame_layout.setContentsMargins(18, 5, 18, 5)
         frame_layout.setSpacing(10)
 
         icon = QLabel(icon_text)
@@ -714,15 +998,15 @@ class BugReporterWindow(QMainWindow):
             Path(tempfile.gettempdir()) / "clickup-bug-reporter"
         )
         self.description_input.setPlaceholderText(
-            "Provide steps to reproduce, environment details, and expected vs actual behavior..."
+            "Provide steps to reproduce, environment details, and expected vs actual behaviour..."
         )
-        self.description_input.setFixedHeight(96)
+        self.description_input.setFixedHeight(236)
         self.description_input.setFrameShape(QFrame.Shape.NoFrame)
         self.description_input.textChanged.connect(self._sync_screenshots_from_editor)
 
-        editor_frame = QFrame()
+        editor_frame = HoverFadeFrame()
         editor_frame.setObjectName("editorFrame")
-        editor_frame.setFixedHeight(132)
+        editor_frame.setFixedHeight(272)
         self.description_input.set_focus_frame(editor_frame)
         editor_layout = QHBoxLayout(editor_frame)
         editor_layout.setContentsMargins(18, 14, 18, 14)
@@ -731,6 +1015,56 @@ class BugReporterWindow(QMainWindow):
         editor_layout.addWidget(self.description_input, 1)
 
         layout.addWidget(editor_frame)
+        return field
+
+    def _build_assignee_field(self) -> QWidget:
+        field = QWidget()
+        layout = QVBoxLayout(field)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        label = QLabel("ASSIGNEE")
+        label.setObjectName("fieldLabel")
+        layout.addWidget(label)
+
+        frame = HoverFadeFrame()
+        frame.setObjectName("inputFrame")
+        frame.setFixedHeight(40)
+        frame_layout = QHBoxLayout(frame)
+        frame_layout.setContentsMargins(18, 4, 10, 4)
+        frame_layout.setSpacing(10)
+
+        self.assignee_input = FocusLineEdit()
+        self.assignee_input.setPlaceholderText("Loading assignees...")
+        self.assignee_input.setEnabled(False)
+        self.assignee_input.set_focus_frame(frame)
+
+        self.assignee_model = QStringListModel([], self)
+        self.assignee_completer = QCompleter(self.assignee_model, self)
+        self.assignee_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.assignee_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.assignee_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.assignee_completer.setMaxVisibleItems(12)
+        self.assignee_input.setCompleter(self.assignee_completer)
+        frame_layout.addWidget(self.assignee_input, 1)
+
+        self.reload_assignees_button = QPushButton()
+        self.reload_assignees_button.setObjectName("compactGhostButton")
+        self.reload_assignees_button.setAccessibleName("Refresh assignees")
+        self.reload_assignees_button.setToolTip("Refresh assignees")
+        self.reload_assignees_button.setIcon(
+            tint_icon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload),
+                QColor(ACTIVE_THEME.muted_icon),
+            )
+        )
+        self.reload_assignees_button.setFixedSize(28, 28)
+        self.reload_assignees_button.clicked.connect(
+            lambda: self._load_assignees(show_errors=True)
+        )
+        frame_layout.addWidget(self.reload_assignees_button)
+
+        layout.addWidget(frame)
         return field
 
     def _build_divider(self) -> QFrame:
@@ -748,53 +1082,48 @@ class BugReporterWindow(QMainWindow):
         discard_button.clicked.connect(self._discard_form)
         controls.addWidget(discard_button)
 
-        self.create_button = QPushButton("Submit  >")
+        self.create_button = QPushButton("Submit")
         self.create_button.setObjectName("primaryButton")
         self.create_button.clicked.connect(self.submit)
         controls.addWidget(self.create_button)
 
         return controls
 
-    def _build_footer(self) -> QLabel:
-        footer = QLabel("DevOps Suite Power User Console   •   Secure Session Active")
-        footer.setObjectName("muted")
-        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        return footer
-
     def _build_toast(self, parent: QWidget) -> QFrame:
         toast = QFrame(parent)
         toast.setObjectName("toast")
-        toast.setFixedSize(320, 86)
+        toast.setFixedHeight(86)
 
         layout = QHBoxLayout(toast)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(12)
 
-        icon_box = QFrame()
-        icon_box.setObjectName("iconBox")
-        icon_box.setFixedSize(40, 40)
-        icon_layout = QHBoxLayout(icon_box)
-        icon_layout.setContentsMargins(0, 0, 0, 0)
-        icon = QLabel("ok")
-        icon.setObjectName("accent")
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_layout.addWidget(icon)
-        layout.addWidget(icon_box)
-
         text_layout = QVBoxLayout()
         text_layout.setSpacing(2)
 
-        title = QLabel("Task Submitted")
-        title.setObjectName("accent")
-        text_layout.addWidget(title)
+        self.toast_title = QLabel("Task Submitted")
+        self.toast_title.setObjectName("accent")
+        text_layout.addWidget(self.toast_title)
 
-        self.toast_detail = QLabel("Task has been initialized.")
+        self.toast_detail = QLabel("Task has been initialised.")
         self.toast_detail.setObjectName("muted")
         text_layout.addWidget(self.toast_detail)
 
         layout.addLayout(text_layout, 1)
+        self._resize_toast_to_content(toast)
 
         return toast
+
+    def _resize_toast_to_content(self, toast: QFrame | None = None) -> None:
+        target = toast or self.toast
+        if not target:
+            return
+
+        content_width = max(
+            self.toast_title.sizeHint().width(),
+            self.toast_detail.sizeHint().width(),
+        )
+        target.setFixedWidth(content_width + 32)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override name
         super().resizeEvent(event)
@@ -814,6 +1143,7 @@ class BugReporterWindow(QMainWindow):
             return
 
         self.toast_detail.setText(detail)
+        self._resize_toast_to_content()
         self._position_toast()
         self.toast.show()
         self.toast.raise_()
@@ -834,6 +1164,65 @@ class BugReporterWindow(QMainWindow):
         self.attachments = []
         self._set_status("Ready" if self.token else "CLICKUP_API_TOKEN missing")
 
+    def _load_assignees(self, *, show_errors: bool = False) -> None:
+        if self.assignee_thread is not None:
+            return
+
+        if not self.token:
+            self.assignee_ids_by_label.clear()
+            self.assignee_model.setStringList([])
+            self.assignee_input.clear()
+            self.assignee_input.setPlaceholderText("Configure CLICKUP_API_TOKEN first")
+            self.assignee_input.setEnabled(False)
+            return
+
+        self.show_assignee_load_errors = show_errors
+        self.reload_assignees_button.setEnabled(False)
+        self.assignee_input.setEnabled(False)
+        self.assignee_input.clear()
+        self.assignee_input.setPlaceholderText("Loading assignees...")
+
+        self.assignee_thread = QThread()
+        self.assignee_worker = LoadAssigneesWorker(self.token)
+        self.assignee_worker.moveToThread(self.assignee_thread)
+
+        self.assignee_thread.started.connect(self.assignee_worker.run)
+        self.assignee_worker.finished.connect(self._assignees_loaded)
+        self.assignee_worker.failed.connect(self._assignees_failed)
+        self.assignee_worker.finished.connect(self.assignee_thread.quit)
+        self.assignee_worker.failed.connect(self.assignee_thread.quit)
+        self.assignee_thread.finished.connect(self.assignee_worker.deleteLater)
+        self.assignee_thread.finished.connect(self.assignee_thread.deleteLater)
+        self.assignee_thread.finished.connect(self._clear_assignee_worker)
+        self.assignee_thread.start()
+
+    def _assignees_loaded(self, members: list[dict]) -> None:
+        self.assignee_ids_by_label = {
+            member["label"].casefold(): member["id"] for member in members
+        }
+        self.assignee_model.setStringList([member["label"] for member in members])
+        self.assignee_input.clear()
+        self.assignee_input.setPlaceholderText("Type to search assignees (optional)")
+        self.assignee_input.setEnabled(True)
+        self.reload_assignees_button.setEnabled(True)
+        self._set_status(f"Loaded {len(members)} assignee(s).")
+
+    def _assignees_failed(self, message: str) -> None:
+        self.assignee_ids_by_label.clear()
+        self.assignee_model.setStringList([])
+        self.assignee_input.clear()
+        self.assignee_input.setPlaceholderText("Unable to load assignees")
+        self.assignee_input.setEnabled(False)
+        self.reload_assignees_button.setEnabled(True)
+        self._set_status("Assignee loading failed.")
+
+        if self.show_assignee_load_errors:
+            self._show_error("ClickUp error", message)
+
+    def _clear_assignee_worker(self) -> None:
+        self.assignee_worker = None
+        self.assignee_thread = None
+
     def submit(self) -> None:
         try:
             target_value = self.target_input.text()
@@ -853,15 +1242,26 @@ class BugReporterWindow(QMainWindow):
 
             title = self.title_input.text().strip()
             description = self._description_markdown()
+            title_source = (
+                self.description_input.toPlainText()
+                .replace("\ufffc", "[Screenshot]")
+                .strip()
+            )
+            assignee_id = selected_assignee_id(
+                self.assignee_input.text(),
+                self.assignee_ids_by_label,
+            )
 
             if not self.token:
                 raise ValueError("Add CLICKUP_API_TOKEN to .env and restart the app.")
             if not target_id:
                 raise ValueError(target_error)
-            if not title:
-                raise ValueError("Task title is required.")
             if not description:
                 raise ValueError("Task description or a pasted screenshot is required.")
+            if not self.claude_api_key:
+                raise ValueError(
+                    "Add ANTHROPIC_API_KEY to .env for AI description formatting."
+                )
         except ValueError as error:
             self._show_error("Missing information", str(error))
             return
@@ -878,6 +1278,9 @@ class BugReporterWindow(QMainWindow):
             description,
             mode=self.mode,
             target_workspace_id=target_workspace_id,
+            assignee_id=assignee_id,
+            claude_api_key=self.claude_api_key,
+            title_source=title_source,
         )
         self.worker.moveToThread(self.worker_thread)
 
@@ -917,13 +1320,16 @@ class BugReporterWindow(QMainWindow):
 
     def _task_created(self, task_url: str) -> None:
         self.create_button.setEnabled(True)
-        self.create_button.setText("Submit  >")
+        self.create_button.setText("Submit")
+        self.title_input.clear()
+        self.description_input.clear()
+        self.attachments = []
         self._set_status("Task created.")
-        self._show_toast("ClickUp task has been initialized.")
+        self._show_toast("ClickUp task has been initialised.")
 
     def _task_failed(self, message: str) -> None:
         self.create_button.setEnabled(True)
-        self.create_button.setText("Submit  >")
+        self.create_button.setText("Submit")
         self._set_status("Task creation failed.")
         self._show_error("ClickUp error", message)
 
@@ -953,6 +1359,105 @@ def extract_list_id(value: str) -> str:
             return match.group(1)
 
     return ""
+
+
+def task_dates_for_today(now: datetime | None = None) -> dict[str, int | bool]:
+    local_now = now or datetime.now()
+    today_at_4am = local_now.replace(hour=4, minute=0, second=0, microsecond=0)
+    timestamp_ms = int(today_at_4am.timestamp() * 1000)
+
+    return {
+        "start_date": timestamp_ms,
+        "start_date_time": False,
+        "due_date": timestamp_ms,
+        "due_date_time": False,
+    }
+
+
+def extract_workspace_members(workspaces: list[dict]) -> list[dict]:
+    members_by_id: dict[int, dict] = {}
+    multiple_workspaces = len(workspaces) > 1
+
+    for workspace in workspaces:
+        workspace_name = str(workspace.get("name") or "Workspace")
+
+        for membership in workspace.get("members") or []:
+            user = membership.get("user", membership)
+
+            try:
+                user_id = int(user["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            name = str(user.get("username") or user.get("email") or f"User {user_id}")
+            email = str(user.get("email") or "")
+            label = name if not email or email.casefold() == name.casefold() else f"{name} ({email})"
+            if multiple_workspaces:
+                label = f"{label} — {workspace_name}"
+
+            members_by_id.setdefault(user_id, {"id": user_id, "label": label})
+
+    return sorted(members_by_id.values(), key=lambda member: member["label"].casefold())
+
+
+def extract_screenshot_placeholders(description: str) -> tuple[str, dict[str, str]]:
+    screenshot_pattern = re.compile(
+        r"!\[Screenshot \d+\]\(data:[^)]+\)",
+        re.IGNORECASE,
+    )
+    screenshots: dict[str, str] = {}
+
+    def replace_screenshot(match: re.Match) -> str:
+        token = f"[[SCREENSHOT_{len(screenshots) + 1}]]"
+        screenshots[token] = match.group(0)
+        return token
+
+    return screenshot_pattern.sub(replace_screenshot, description), screenshots
+
+
+def restore_screenshot_markdown(
+    description: str,
+    screenshots: dict[str, str],
+) -> str:
+    restored = description
+    for token, screenshot_markdown in screenshots.items():
+        if token not in restored:
+            restored = f"{restored.rstrip()}\n\n{screenshot_markdown}"
+        else:
+            restored = restored.replace(token, screenshot_markdown, 1)
+            restored = restored.replace(token, "")
+
+    return restored.strip()
+
+
+def selected_assignee_id(text: str, assignee_ids_by_label: dict[str, int]) -> int | None:
+    label = text.strip()
+    if not label:
+        return None
+
+    assignee_id = assignee_ids_by_label.get(label.casefold())
+    if assignee_id is None:
+        raise ValueError(
+            "Select an assignee from the search suggestions, or leave the assignee blank."
+        )
+
+    return assignee_id
+
+
+def create_task_with_status_fallback(
+    client: ClickUpClient,
+    list_id: str,
+    payload: dict,
+) -> dict:
+    try:
+        return client.create_task(list_id, payload)
+    except ClickUpError as error:
+        if "status" not in payload or "status not found" not in str(error).casefold():
+            raise
+
+        fallback_payload = dict(payload)
+        fallback_payload.pop("status")
+        return client.create_task(list_id, fallback_payload)
 
 
 def extract_task_id(value: str) -> str:
@@ -1142,9 +1647,10 @@ def _image_data_uri(path: Path) -> str:
 
 
 def main() -> int:
+    configure_windows_app_identity()
     app = QApplication(sys.argv)
     app.setApplicationName("ClickUp Bug Reporter")
-    app.setWindowIcon(QIcon())
+    app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)
 
