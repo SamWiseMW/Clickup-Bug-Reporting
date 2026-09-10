@@ -78,6 +78,7 @@ class TaskDatesForTodayTests(unittest.TestCase):
             patch("app.ClickUpClient", return_value=client),
             patch("app.ClaudeClient", return_value=claude_client),
             patch("app.task_dates_for_today", return_value=expected_dates),
+            patch("app.resolve_default_custom_fields", return_value=[]),
         ):
             worker.run()
 
@@ -89,6 +90,7 @@ class TaskDatesForTodayTests(unittest.TestCase):
                 "tags": ["bug"],
                 "status": "to do",
                 "assignees": [42],
+                "custom_fields": [],
                 **expected_dates,
             },
         )
@@ -118,6 +120,7 @@ class TaskDatesForTodayTests(unittest.TestCase):
             patch("app.ClickUpClient", return_value=client),
             patch("app.ClaudeClient", return_value=claude_client),
             patch("app.task_dates_for_today", return_value=expected_dates),
+            patch("app.resolve_default_custom_fields", return_value=[]),
         ):
             worker.run()
 
@@ -129,6 +132,7 @@ class TaskDatesForTodayTests(unittest.TestCase):
                 "tags": ["bug"],
                 "status": "to do",
                 "parent": "parent",
+                "custom_fields": [],
                 **expected_dates,
             },
         )
@@ -225,6 +229,17 @@ class TaskDatesForTodayTests(unittest.TestCase):
         )
         self.assertIn("![Screenshot 1](data:image/png;base64,abc123)", restored)
         self.assertNotIn("[[SCREENSHOT_1]]", restored)
+
+    def test_real_screenshots_survive_while_invented_tokens_are_removed(self) -> None:
+        image = "![Screenshot 1](data:image/png;base64,abc123)"
+        result = restore_screenshot_markdown(
+            "Fix hover\n[[SCREENSHOT_1]]\n[[SCREENSHOT_2]]\n"
+            "https://vimeo.com/123456789",
+            {"[[SCREENSHOT_1]]": image},
+        )
+        self.assertEqual(result.count(image), 1)
+        self.assertIn("https://vimeo.com/123456789", result)
+        self.assertNotIn("[[SCREENSHOT_", result)
 
 
 if __name__ == "__main__":

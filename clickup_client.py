@@ -82,6 +82,16 @@ class ClickUpClient:
     def create_task(self, list_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", f"/list/{list_id}/task", json=payload)
 
+    def get_list_custom_fields(self, list_id: str) -> list[dict[str, Any]]:
+        data = self._request(
+            "GET", f"/list/{list_id}/field",
+            params={"include_applied_objects": "true"},
+        )
+        fields = data.get("fields")
+        if not isinstance(fields, list):
+            raise ClickUpError("ClickUp returned an invalid custom field response.")
+        return fields
+
     def get_view(self, view_id: str) -> dict[str, Any]:
         return self._request("GET", f"/view/{view_id}")
 

@@ -60,7 +60,9 @@ from PySide6.QtWidgets import (
 )
 
 from clickup_client import ClickUpClient, ClickUpError
-from claude_client import ClaudeClient, ClaudeError
+from claude_client import (
+    ClaudeClient, ClaudeError, normalise_page_url, title_from_formatted_description,
+)
 
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -68,7 +70,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 LIST_ID_PATTERNS = [
     re.compile(r"/li(?:st)?/(\d+)", re.IGNORECASE),
     re.compile(r"/list/(\d+)", re.IGNORECASE),
-    re.compile(r"/v/l/([^/?#]+)", re.IGNORECASE),
+    re.compile(r"/v/[lb]/([^/?#]+)", re.IGNORECASE),
     re.compile(r"[?&]list(?:_id)?=(\d+)", re.IGNORECASE),
 ]
 TASK_QUERY_KEYS = (
@@ -90,6 +92,11 @@ IMAGE_PREVIEW_MAX_WIDTH = 320
 IMAGE_PREVIEW_MAX_HEIGHT = 120
 HOVER_FADE_MS = 180
 DEFAULT_TASK_STATUS = "to do"
+DEFAULT_CUSTOM_FIELDS = (
+    ("Process Owner", "Developer"),
+    ("Type of hours (ACCESS)", "ACCESS Tech"),
+    ("Dev category", "Development"),
+)
 APP_ICON_PATH = Path(__file__).with_name("public") / (
     "favicon.ico" if sys.platform == "win32" else "favicon.png"
 )
@@ -694,6 +701,7 @@ class CreateTaskWorker(QObject):
         assignee_id: int | None = None,
         claude_api_key: str = "",
         title_source: str = "",
+        page_url: str = "",
     ) -> None:
         super().__init__()
         self.token = token
@@ -705,31 +713,37 @@ class CreateTaskWorker(QObject):
         self.assignee_id = assignee_id
         self.claude_api_key = claude_api_key
         self.title_source = title_source
+        self.page_url = page_url
 
     def run(self) -> None:
         try:
             client = ClickUpClient(lambda: self.token)
             claude_client = ClaudeClient(self.claude_api_key)
+            page_context = {"page_url": normalise_page_url(self.page_url)} if self.page_url else {}
 
             self.status_changed.emit("Organising description with Claude...")
             description_source, screenshots = extract_screenshot_placeholders(
                 self.description
             )
-            description = claude_client.format_bug_description(description_source)
+            description = claude_client.format_bug_description(description_source, **page_context)
             if not description.strip():
                 raise ClaudeError(
                     "Add a clear description of the issue before submitting."
                 )
-            description = restore_screenshot_markdown(description, screenshots)
-
-            title = self.title
+            title = self.title.strip()
             if not title:
                 self.status_changed.emit("Generating title with Claude...")
-                title = claude_client.generate_bug_title(self.title_source)
+                title_source = self.title_source.strip() or description_source
+                title = claude_client.generate_bug_title(title_source, **page_context)
+                if not title.strip():
+                    title = title_from_formatted_description(
+                        description, title_source, **page_context
+                    )
             if not title.strip():
                 raise ClaudeError(
                     "Add a clear description so a task title can be generated."
                 )
+            description = restore_screenshot_markdown(description, screenshots)
 
             self.status_changed.emit("Creating subtask..." if self.mode == "subtask" else "Creating task...")
             task_dates = task_dates_for_today()
@@ -763,6 +777,9 @@ class CreateTaskWorker(QObject):
             if self.assignee_id is not None:
                 payload["assignees"] = [self.assignee_id]
 
+            payload["custom_fields"] = resolve_default_custom_fields(
+                client.get_list_custom_fields(list_id)
+            )
             task = create_task_with_status_fallback(client, list_id, payload)
             self.finished.emit(task.get("url", ""))
         except (ClaudeError, ClickUpError, KeyError, ValueError) as error:
@@ -884,6 +901,15 @@ class BugReporterWindow(QMainWindow):
         self.title_field.hide()
         layout.addWidget(self.title_field)
 
+        self.page_url_input = FocusLineEdit()
+        self.page_url_field = self._build_input_field(
+            "PAGE URL (OPTIONAL)",
+            "",
+            "https://example.com/about-us",
+            self.page_url_input,
+        )
+        layout.addWidget(self.page_url_field)
+
         layout.addWidget(self._build_description_field())
         layout.addWidget(self._build_divider())
         layout.addLayout(self._build_controls())
@@ -1000,13 +1026,13 @@ class BugReporterWindow(QMainWindow):
         self.description_input.setPlaceholderText(
             "Provide steps to reproduce, environment details, and expected vs actual behaviour..."
         )
-        self.description_input.setFixedHeight(236)
+        self.description_input.setMinimumHeight(152)
         self.description_input.setFrameShape(QFrame.Shape.NoFrame)
         self.description_input.textChanged.connect(self._sync_screenshots_from_editor)
 
         editor_frame = HoverFadeFrame()
         editor_frame.setObjectName("editorFrame")
-        editor_frame.setFixedHeight(272)
+        editor_frame.setMinimumHeight(188)
         self.description_input.set_focus_frame(editor_frame)
         editor_layout = QHBoxLayout(editor_frame)
         editor_layout.setContentsMargins(18, 14, 18, 14)
@@ -1241,6 +1267,7 @@ class BugReporterWindow(QMainWindow):
                 )
 
             title = self.title_input.text().strip()
+            page_url = normalise_page_url(self.page_url_input.text())
             description = self._description_markdown()
             title_source = (
                 self.description_input.toPlainText()
@@ -1281,6 +1308,7 @@ class BugReporterWindow(QMainWindow):
             assignee_id=assignee_id,
             claude_api_key=self.claude_api_key,
             title_source=title_source,
+            page_url=page_url,
         )
         self.worker.moveToThread(self.worker_thread)
 
@@ -1427,6 +1455,8 @@ def restore_screenshot_markdown(
             restored = restored.replace(token, screenshot_markdown, 1)
             restored = restored.replace(token, "")
 
+    # Any remaining placeholder has no corresponding pasted screenshot.
+    restored = re.sub(r"\[\[SCREENSHOT_\d+\]\]", "", restored, flags=re.IGNORECASE)
     return restored.strip()
 
 
@@ -1442,6 +1472,42 @@ def selected_assignee_id(text: str, assignee_ids_by_label: dict[str, int]) -> in
         )
 
     return assignee_id
+
+
+def resolve_default_custom_fields(fields: list[dict]) -> list[dict]:
+    """Set available defaults; leave missing or ambiguous fields unset."""
+    def normalise_name(value: str) -> str:
+        # Ignore decorative emoji, capitalisation and whitespace in field labels.
+        return " ".join("".join(
+            char for char in value.casefold() if char.isalnum() or char.isspace()
+        ).split())
+
+    values = []
+    for name, option_name in DEFAULT_CUSTOM_FIELDS:
+        matches = [
+            field for field in fields
+            if normalise_name(str(field.get("name", ""))) == normalise_name(name)
+        ]
+        if len(matches) != 1:
+            continue
+        field = matches[0]
+        scoped_types = [
+            item.get("object_id") for item in field.get("applied_objects", [])
+            if str(item.get("object_type")) == "19"
+        ]
+        if scoped_types and not any(str(value) == "0" for value in scoped_types):
+            continue
+        if field.get("type") != "drop_down" or not field.get("id"):
+            continue
+        options = field.get("type_config", {}).get("options", [])
+        selected = [
+            option for option in options
+            if normalise_name(str(option.get("name", ""))) == normalise_name(option_name)
+        ]
+        if len(selected) != 1 or not selected[0].get("id"):
+            continue
+        values.append({"id": field["id"], "value": selected[0]["id"]})
+    return values
 
 
 def create_task_with_status_fallback(

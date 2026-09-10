@@ -12,6 +12,8 @@ One-page PySide6 desktop app with:
 - Task title field.
 - Automatic Claude-generated title when the title field is left blank.
 - Automatic Claude formatting of descriptions into URLs/Location and Requirements.
+- Optional Page URL above the description determines the title's page name and
+  URLs/Location. It stays populated after task creation for repeat reports.
 - Optional searchable assignee picker populated from authorised ClickUp Workspaces.
 - Combined description and screenshot field.
 - ClickUp task creation.
